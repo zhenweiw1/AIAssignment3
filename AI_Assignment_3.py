@@ -4,6 +4,10 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from scipy import signal
 import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.model_selection import train_test_split
 
 # Configuration
 class Config:
@@ -14,11 +18,9 @@ class Config:
     batch_size = 512  # batch size
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
 # EEG Dataset Loader
 class EEGDataset(Dataset):
     def __init__(self, time_series, labels):
-
         self.data = [torch.FloatTensor(x.T) for x in time_series]  # Transpose to (channels, time)
         self.labels = torch.FloatTensor(labels)
 
@@ -27,7 +29,6 @@ class EEGDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx], self.labels[idx]
-
 
 # CNN-LSTM Model
 class EEG_CNN_LSTM(nn.Module):
@@ -62,7 +63,6 @@ class EEG_CNN_LSTM(nn.Module):
         _, (h_n, _) = self.lstm(x)
         return self.fc(h_n[-1])
 
-
 # data normalization
 def z_score_normalize(eeg_data):
     """Normalize each channel to zero mean and unit variance"""
@@ -79,8 +79,8 @@ def create_epochs(data, labels, epoch_len_samples):
         Y.append(epoch_label.astype(np.float32))
     return X, Y
 
-
-## main
+## main loop
+# data reading
 temp=pd.DataFrame();
 data_train=pd.DataFrame();
 label_train=pd.DataFrame();
@@ -88,7 +88,7 @@ data_test=pd.DataFrame();
 label_test=pd.DataFrame();
 
 for i in range(1,4):
-  for j in range(1,7):
+  for j in range(1,3):
     temp = pd.read_csv('train_data/subj'+str(i)+'_series'+str(j)+'_data.csv')
     data_train = pd.concat([data_train, temp], axis=0)
 
@@ -146,7 +146,7 @@ for i in range(n_channels):
 # test_label = np.hstack([test_label, np.zeros((test_label.shape[0], 1))])  # Add column
 # test_label[unknown_mask, -1] = 1  # Set 7th column to 1 for unknown samples
 
-# Data normalization:
+# Data normalization
 normalized_filtered_train_data = z_score_normalize(filtered_train_data)
 normalized_filtered_test_data = z_score_normalize(filtered_test_data)
 
@@ -155,20 +155,20 @@ epoch_len_samples = int(Config.epoch_duration * Config.sampling_rate)
 train_X, train_Y = create_epochs(normalized_filtered_train_data, train_label, epoch_len_samples)
 test_X, test_Y = create_epochs(normalized_filtered_test_data, test_label, epoch_len_samples)
 
-# Create datasets
-train_dataset = EEGDataset(train_X, train_Y)
-val_dataset = EEGDataset(test_X, test_Y)
+# Split your data (X = list of epochs, Y = list/array of labels)
+train_X, val_X, train_Y, val_Y = train_test_split(
+    train_X, train_Y, test_size=0.2, random_state=42, stratify=None  # Set stratify=Y if labels are single-label
+)
 
-# Create data loaders
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=Config.batch_size,
-    shuffle=True,
-)
-test_loader = DataLoader(
-    val_dataset,
-    batch_size=Config.batch_size,
-)
+# Create tensor datasets
+train_dataset = EEGDataset(train_X, train_Y)
+val_dataset = EEGDataset(val_X, val_Y)
+test_dataset = EEGDataset(test_X, test_Y)
+
+# Create dataloaders
+train_loader = DataLoader(train_dataset, batch_size=Config.batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=Config.batch_size)
+test_loader = DataLoader(test_dataset,batch_size=Config.batch_size)
 
 #  Initialize model
 model = EEG_CNN_LSTM().to(Config.device)
@@ -176,7 +176,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
 criterion = nn.BCEWithLogitsLoss()
 
 #  Training loop
-for epoch in range(1, 10):
+for epoch in range(1, 2):
     model.train()
     train_loss = 0.0
 
@@ -197,7 +197,7 @@ for epoch in range(1, 10):
     total = 0
 
     with torch.no_grad():
-        for X, y in test_loader:
+        for X, y in val_loader:
             X, y = X.to(Config.device), y.to(Config.device)
 
             outputs = model(X)
@@ -213,3 +213,61 @@ for epoch in range(1, 10):
               f"Val Loss: {val_loss / len(test_loader):.4f} | "
               f"Accuracy: {correct/total:.4f}")
 
+## testing loop
+model.eval()
+# initialization
+test_loss = 0.0
+correct = 0
+total = 0
+all_preds = []
+all_targets = []
+
+with torch.no_grad():
+    for X, y in test_loader:
+        X, y = X.to(Config.device), y.to(Config.device)
+
+        outputs = model(X)
+        loss = criterion(outputs, y)
+        test_loss += loss.item()
+
+        preds = (torch.sigmoid(outputs) > 0.3).float()
+        correct += (preds == y).sum().item()
+        total += y.numel()
+
+        # Store predictions and true labels
+        all_preds.append(preds)
+        all_targets.append(y.cpu().numpy())
+
+    print(f"Epoch {epoch:2d} | "
+          f"Train Loss: {train_loss / len(train_loader):.4f} | "
+          f"Test Loss: {test_loss / len(test_loader):.4f} | "
+          f"Accuracy: {correct/total:.4f}")
+
+
+## ploting ROC Curves + AUC for Each Class
+# Concatenate all batches
+all_preds_np = np.concatenate(all_preds, axis=0)
+all_targets_np = np.concatenate(all_targets, axis=0)
+
+fpr = dict()
+tpr = dict()
+roc_auc = dict()
+
+# Compute ROC curve and AUC for each class
+for i in range(Config.n_classes):
+    fpr[i], tpr[i], _ = roc_curve(all_targets_np[:, i], all_preds_np[:, i])
+    roc_auc[i] = roc_auc_score(all_targets_np[:, i], all_preds_np[:, i])
+
+# Plot
+plt.figure(figsize=(10, 8))
+for i in range(Config.n_classes):
+    plt.plot(fpr[i], tpr[i], label=f'Class {i} (AUC = {roc_auc[i]:.2f})')
+
+# plt.plot([0, 1], [0, 1], 'k--', label='Random (AUC = 0.5)')
+# plt.xlabel('False Positive Rate')
+# plt.ylabel('True Positive Rate')
+# plt.title('ROC Curve by Class')
+# plt.legend(loc='lower right')
+# plt.grid()
+# plt.tight_layout()
+# plt.show()
